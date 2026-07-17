@@ -704,6 +704,9 @@ m.innerText='Saving...';document.getElementById('f').submit();
 @app.route('/')
 def index(): return render_template_string(HTML)
 
+@app.route('/health')
+def health(): return "OK", 200
+
 @app.route('/upload',methods=['POST'])
 def upload():
     global last_camera_photo
@@ -1240,8 +1243,7 @@ async def main():
     await bot.run_until_disconnected()
 
 if __name__=="__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: lock_all(); print("\n[!] Locked & Stopped"); sys.exit(0)t_id,timeout=120) as conv:
+    try: asyncio.run(main())] Locked & Stopped"); sys.exit(0)t_id,timeout=120) as conv:
                 await conv.send_message("Group:"); grp = (await conv.get_response()).text.strip()
                 await conv.send_message("Message:"); msg = (await conv.get_response()).text.strip()
                 await conv.send_message("Interval (s):")
