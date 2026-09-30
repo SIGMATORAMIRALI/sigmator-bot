@@ -1,5 +1,4 @@
 telethon
+aiohttp
 flask
-requests
-beautifulsoup4
-cryptography
+python-dotenv
