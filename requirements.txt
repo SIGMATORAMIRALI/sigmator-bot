@@ -1,0 +1,6 @@
+telethon
+aiohttp
+flask
+python-dotenv
+cryptg
+python-socks[asyncio]
